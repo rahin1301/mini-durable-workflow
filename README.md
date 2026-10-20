@@ -1,39 +1,38 @@
-# Mini durable workflow engine
+# Mini Durable Workflow
 
-A small from-scratch version of the idea behind Temporal. Workflows wait on real time,
-react to events, can get `kill -9`'d in the middle of all that, and still pick up right
-where they left off when you restart them.
+A small, from-scratch version of the core idea behind Temporal: workflows that can wait on
+timers and events, get killed halfway through, and continue from the same point after a
+restart.
 
-The thing I used to test it is a marketing rule, basically:
+Java 21 + SQLite, no framework. About 1.25k lines of code and 41 tests.
 
-> **match** — user opened the app **and** viewed a product within X minutes **and** did
-> **not** check out within Y minutes
->
-> **then** — send a push, and if it's not confirmed delivered within Z minutes, fall back
-> to SMS
+## Example use case
 
-I worked with Temporal for a few years and used it as a black box the whole time. I never
-really got how a rule like this could sit half-matched for hours, survive a redeploy, and
-just keep going like nothing happened. So I sat down and built the part that does that.
+The engine is tested on a marketing-style rule:
 
-Java 21, SQLite, no framework. Around 1.3k lines, 41 tests.
+- **Match:** the user opened the app, viewed a product within X seconds, and did *not*
+  check out within Y seconds.
+- **Then:** send a push. If it isn't confirmed delivered within Z seconds, send an SMS
+  instead.
 
-## Running the demo
+The interesting part is that this rule can sit half-matched for a long time and has to
+survive a crash or redeploy in the middle.
+
+## Demo
 
 ```sh
 ./demo.sh
 ```
 
-It runs three scenarios. In the first one a journey starts, a `PRODUCT_VIEWED` event comes
-in, and then I `kill -9` the process while it's still waiting on the checkout window:
+Scenario 1 starts a journey, sends a `PRODUCT_VIEWED` event, and then `kill -9`s the
+process while it's waiting on the checkout window:
 
 ```
-[10:32:36] rule: viewed a product within 10s, and did NOT check out within 15s
-[10:32:36] user-7 launched the app, waiting 10s for a product view
-[10:32:39] user event: PRODUCT_VIEWED
-[10:32:39] viewed a product. did they check out within 15s?
+[11:21:44] user-7 launched the app, waiting 8s for a product view
+[11:21:47] event: PRODUCT_VIEWED
+[11:21:47] viewed a product. did they check out within 10s?
 
---- kill -9 87384, six seconds in and waiting on the checkout window ---
+--- kill -9 62145, waiting on the checkout window ---
 the process is gone. all that's left is the log:
 0|WORKFLOW_STARTED
 1|TIMER_STARTED
@@ -41,26 +40,23 @@ the process is gone. all that's left is the log:
 3|TIMER_CANCELLED
 4|TIMER_STARTED
 
-[10:41:53] restarted. nothing in memory, reading the log
-[10:41:53] found user-7 mid-journey with 5 events
-[10:41:58] no checkout in the window, the rule matched
-[10:41:58] SENDING PUSH to user-7
-[10:41:58] waiting 6s for a delivery confirmation
-[10:42:04] push never confirmed delivered, falling back to SMS
-[10:42:04] SENDING SMS FALLBACK to user-7
+[11:21:52] restarted. nothing in memory, reading the log
+[11:21:52] found user-7 mid-journey with 5 events
+[11:21:57] no checkout in the window, the rule matched
+[11:21:57] SENDING PUSH to user-7
+[11:21:57] waiting 6s for a delivery confirmation
+[11:22:03] push never confirmed delivered, falling back to SMS
+[11:22:03] SENDING SMS FALLBACK to user-7
 ```
 
-The process that restarts has never seen this user before. All it has is 5 rows in a
-SQLite file. From that it figures out a product view already happened, that the first
-timer got cancelled, and that there's a checkout deadline still running — waits it out to
-the second, and then moves into the follow-up chain that the first process never got to
-see.
+The new process has nothing in memory, only 5 rows in SQLite. From those it works out
+that the product view already happened and that the checkout timer is still running. It
+waits out the rest of that timer and then continues into the push/SMS part.
 
-The other two scenarios in the demo just take the other branch each time: `CHECKOUT`
-comes in before the deadline so nothing gets sent, or the delivery confirmation comes in
-on time so SMS never fires.
+Scenario 2 sends `CHECKOUT` in time, so nothing is sent. Scenario 3 confirms delivery in
+time, so the SMS fallback never fires.
 
-## The rule itself, in code
+## The workflow code
 
 ```java
 Set<String> seen = new HashSet<>();
@@ -69,16 +65,15 @@ ctx.onSignal("PRODUCT_VIEWED",  e -> seen.add("PRODUCT_VIEWED"));
 ctx.onSignal("CHECKOUT",        e -> seen.add("CHECKOUT"));
 ctx.onSignal("DELIVERY_UPDATE", delivery::set);
 
-// match: viewed a product within X...
+// viewed a product within X
 if (!ctx.awaitUntil(viewWindow, () -> seen.contains("PRODUCT_VIEWED"))) {
     return;
 }
-// ...and did NOT check out within Y
+// and did NOT check out within Y
 if (ctx.awaitUntil(checkoutWindow, () -> seen.contains("CHECKOUT"))) {
     return;
 }
 
-// engagement: send, then follow up unless it lands in time
 ctx.executeActivity("sendPush", userId);
 if (ctx.awaitUntil(deliveryWindow, () -> "VENDOR_DELIVERED".equals(delivery.get()))) {
     return;
@@ -86,151 +81,126 @@ if (ctx.awaitUntil(deliveryWindow, () -> "VENDOR_DELIVERED".equals(delivery.get(
 ctx.executeActivity("sendSms", userId);
 ```
 
-Every branch is really the same thing underneath. `awaitUntil` gives back true if the
-event won, false if the deadline won. So "did B happen within X" is the true branch, and
-"did NOT do C within Y" is just the false branch of the same call, same for "wasn't
-delivered in time". `seen` and `delivery` are nothing special, just plain local variables,
-and the function can return from any of the three waits.
+`awaitUntil` returns `true` if the condition became true first and `false` if the timer
+ran out first. "Did X happen within N seconds" and "did X *not* happen" are just the two
+branches of the same call. `seen` and `delivery` are normal local variables.
 
-## Why this is actually hard
+## How it works
 
-Saving the deadline itself isn't the hard part. The hard part is that a workflow that's
-half done has local variables, is sitting at some point in an if/else, maybe it's inside a
-try/catch. None of that can be turned into bytes and written to disk, Java doesn't let you
-serialize a stack frame.
+A half-finished workflow has local variables and is somewhere inside an if/else. Java
+can't serialize a stack frame, so that state can't just be saved to disk.
 
-So instead of saving it, the engine just runs the function again from scratch.
+Instead, the engine **replays** the workflow:
 
-Every decision the workflow makes gets written to a log first. To recover a workflow, the
-engine calls the workflow function again from the top, and whenever it asks for something
-that already happened before, it gets fed the answer from the log instead of doing it for
-real. That includes signals — they get replayed in the same order they originally arrived,
-so `seen` ends up with the same contents it had before the crash. Same code, same
-recorded answers in, same branch taken, and it just continues from there.
+1. Every decision the workflow makes (start a timer, run an activity, etc.) is appended
+   to an event log in SQLite.
+2. To continue a workflow, the engine calls the workflow function again from the top.
+3. Each call that already has a result in the log gets that recorded result back instead
+   of running again. Signals are replayed in their original order, so `seen` ends up the
+   same as before the crash.
+4. When the workflow reaches a call that isn't in the log yet, it unwinds. The engine runs
+   that step for real, writes the result to the log, and replays again.
 
-When the workflow asks for something that isn't in the log yet, that call unwinds out of
-the whole function. The engine notes down what was asked for, actually does that piece of
-work outside of replay, writes the result to the log, and calls the function again from
-the top. So the workflow function itself gets run over and over, but each activity — an
-actual side effect like sending a push — only happens once.
+So the workflow function runs many times, but each activity (the actual side effect, like
+sending a push) only runs once.
 
-That's also the reason recovery isn't some special separate code path. `recover()` is
-just a loop over whatever instance was left RUNNING, calling the exact same `drive()`
-method that runs during normal operation.
+Recovery after a crash uses the same code path as normal execution. `recover()` just
+loops over instances still marked RUNNING and calls the same `drive()` method.
 
-## Where to look in the code
+### Design details
 
-| File | |
+**Determinism check.** Recorded results are matched to calls by their position in the log.
+If the workflow code takes a different path than last time (usually because the code was
+changed while an instance was running), result #3 would no longer mean what the code
+expects. The engine compares each command against the log and throws
+`NonDeterministicException` if they don't match.
+
+**Deadlines are stored, not recomputed.** `awaitUntil` reads the clock once, when the timer
+is created, and saves the deadline in the event. Calling `Instant.now()` on every replay
+would keep pushing the deadline forward.
+
+**Timers and signals.** `awaitUntil` always starts the timer before checking the
+condition, even if the signal already arrived. This costs an extra round sometimes, but
+keeps a single path through the code, so there's no leftover timer pointing at a finished
+workflow. Cancelling a timer is logged as `TIMER_CANCELLED` and checked on replay like any
+other event. Signals that arrive before the wait starts still count, because handlers see
+the whole history in order.
+
+**Inputs.** The time windows are passed in as workflow input, so a workflow restarted
+a week later uses the values it was started with, not whatever the current defaults are.
+
+**Storage.** The `events` table is the source of truth. `workflow_instances` and `timers`
+are indexes over it (to find running workflows and due timers without scanning every
+history). They're written in the same transaction as the events and could be rebuilt from
+the log.
+
+Appends are optimistic: read the history, decide the next step, and append at the
+expected next sequence number. If another process already wrote there, a
+`ConflictException` is thrown and nothing is written. Two processes racing on the same
+workflow can do duplicate work but can't corrupt the history. The demo depends on this,
+since the event emitter and the timer poller are separate processes.
+
+SQLite runs with WAL, `synchronous=FULL` and IMMEDIATE transactions. The reasons are
+commented in `EventStore`.
+
+## Code overview
+
+| File | What it does |
 |---|---|
-| [`WorkflowContext.java`](src/main/java/dev/rahin/durable/WorkflowContext.java) | Start here. `awaitUntil`, `executeActivity`, `sleep` — deciding whether to answer from history or unwind. |
-| [`WorkflowEngine.java`](src/main/java/dev/rahin/durable/WorkflowEngine.java) | The decide loop: replay, collect commands, commit, run side effects, repeat. |
-| [`EventStore.java`](src/main/java/dev/rahin/durable/EventStore.java) | The log itself. Optimistic appends, SQLite durability settings, the timer index. |
-| [`TimerService.java`](src/main/java/dev/rahin/durable/TimerService.java) | Finds timers that are due and fires them. |
-| [`demo/JourneyDemo.java`](src/main/java/dev/rahin/durable/demo/JourneyDemo.java) | The demo above. |
-
-## A few notes on how it's built
-
-**Determinism.** Recorded answers get matched up to calls by their position in the log.
-If the code somehow takes a different path than it did the first time around, answer #3
-doesn't mean what the code thinks it means anymore. So the engine compares every command
-against what was recorded at that position and throws `NonDeterministicException` rather
-than pretending everything's fine. Usually this means the workflow code got changed while
-an instance of it was still running.
-
-This is also why `awaitUntil` reads the clock exactly once — right when the timer gets
-scheduled — and saves that deadline into the event. If it called `Instant.now()` again on
-every replay, the deadline would keep sliding forward and the timer would basically never
-fire.
-
-**Timers vs signals.** `awaitUntil` always starts its timer before checking if a signal
-already showed up, even when one obviously has. That wastes one extra round in the case
-where the condition's already true, but it means there's only ever one path through the
-function — so you can't end up with a cancelled timer sitting in the index and pointing at
-a workflow that's already done.
-
-Cancelling a timer is its own workflow decision too, so `TIMER_CANCELLED` takes up a slot
-in the log like anything else and gets checked on replay same as everything. Signals that
-show up before the wait even starts still count, because handlers see every signal in the
-history in order — so a race between "the user does something" and "the workflow reaches
-the wait" always resolves the same way.
-
-The time windows for a journey get passed in as workflow input instead of hardcoded, so if
-a process restarts a week later it replays the rule it was originally started with, not
-whatever the defaults happen to be by then.
-
-**What's actually the source of truth.** Just the `events` table. `workflow_instances`
-and `timers` are basically indexes on top of it, so I don't have to scan every single
-history to figure out what's running or what's due. They get written in the same
-transaction as the events they come from, and could be rebuilt from the log if they ever
-got lost.
-
-Appends are optimistic — you read a history, figure out what should happen next, and try
-to append at the next sequence number you'd expect to be free. If something else already
-wrote there, you get a `ConflictException` and nothing gets written, because you can't
-just merge in a decision that was made against a history that doesn't exist anymore. Two
-processes racing on the same workflow end up doing duplicate work but can't actually
-corrupt anything — which the demo relies on, since the process handling user events and
-the one polling for timers are two separate processes.
-
-`EventStore` runs SQLite with WAL, `synchronous=FULL`, and IMMEDIATE transactions. I left
-comments next to each one explaining why it's set that way.
+| [`WorkflowContext.java`](src/main/java/dev/rahin/durable/WorkflowContext.java) | `awaitUntil`, `executeActivity`, `sleep`. Decides whether to answer from history or unwind. Best place to start reading. |
+| [`WorkflowEngine.java`](src/main/java/dev/rahin/durable/WorkflowEngine.java) | Main loop: replay, collect commands, commit, run side effects, repeat. |
+| [`EventStore.java`](src/main/java/dev/rahin/durable/EventStore.java) | The event log. Optimistic appends, SQLite settings, timer index. |
+| [`TimerService.java`](src/main/java/dev/rahin/durable/TimerService.java) | Finds due timers and fires them. |
+| [`demo/JourneyDemo.java`](src/main/java/dev/rahin/durable/demo/JourneyDemo.java) | The demo. |
 
 ## Tests
 
-41 tests, run with `mvn test`. Some of the ones that actually matter:
+```sh
+mvn test
+```
 
-- `aTwoWindowJourneyRuns` / `theSameJourneyStopsWhenTheUserChecksOut` — matching works both ways
-- `anUndeliveredMessageFallsBackToTheNextChannel` / `aDeliveredMessageEndsTheChain` — the follow-up chain
-- `workflowCodeRerunsButEachActivityRunsOnce` — the replay contract, in one test
-- `aTimerFiresAfterARestartEvenThoughNothingWasInMemory` — basically the demo, as an assertion
-- `aSignalThatArrivedBeforeTheWaitStartedStillCounts` — the event/wait race
-- `theRecordedFireTimeIsNotRecomputedOnReplay` — deadlines don't drift across replays
-- `changingWorkflowCodeUnderARunningWorkflowIsCaught` — catches non-determinism
-- `anActivityThatRanButWasNotRecordedRunsAgain` — proves the at-least-once thing below
-- `onlyOneAppendCanWinASequence` — eight threads racing the same sequence at once
+Some of the more important ones:
 
-## Stuff that's not great / limitations
+- `aTwoWindowJourneyRuns`, `theSameJourneyStopsWhenTheUserChecksOut`: the rule matches and doesn't match correctly
+- `anUndeliveredMessageFallsBackToTheNextChannel`, `aDeliveredMessageEndsTheChain`: push/SMS fallback
+- `workflowCodeRerunsButEachActivityRunsOnce`: the main replay guarantee
+- `aTimerFiresAfterARestartEvenThoughNothingWasInMemory`: the demo as a test
+- `aSignalThatArrivedBeforeTheWaitStartedStillCounts`: signal vs. wait race
+- `theRecordedFireTimeIsNotRecomputedOnReplay`: deadlines don't drift
+- `changingWorkflowCodeUnderARunningWorkflowIsCaught`: non-determinism detection
+- `anActivityThatRanButWasNotRecordedRunsAgain`: at-least-once behaviour (see below)
+- `onlyOneAppendCanWinASequence`: 8 threads appending to the same sequence number
 
-Being upfront about these instead of letting you find them yourself.
+## Limitations
 
-- Replay gets slower the longer a workflow runs. N steps means the workflow function runs
-  N+1 times, and every run reads the whole history from scratch. Fine for a two-window
-  rule, not fine for something with hundreds of steps. This is the tradeoff you get from
-  unwinding the function instead of parking an actual coroutine like Temporal does. If I
-  kept working on this, this is the first thing I'd fix.
-- Activities are at-least-once, not exactly-once. The side effect happens before the
-  result gets recorded, so if the process dies in between, it runs again after restart.
-  There's literally a test that checks it runs twice. I thought about doing it the other
-  way (record first, run second) but that can lose the activity completely if you die
-  before it runs, which felt worse. The real fix would be giving each activity a dedup key
-  the downstream service checks, I just didn't build that part.
-- No retries for failed activities. If one throws, that's it, it goes straight into the
-  workflow and the workflow deals with it. Retry policies would be next on the list.
-- Signals hold a payload, but nothing buffers them per signal type. A handler just sees
-  each payload as the log replays past it, so something like "was the last delivery update
-  DELIVERED" works fine, but "did any event ever come in with amount > 500" needs the
-  workflow itself to keep track of that.
-- Payloads are literally just two strings split on the first newline. Didn't want to pull
-  in Jackson for something that only needs to hold a name and a blob. It works, but I
-  wouldn't ship it like this.
-- Timers get checked by polling every 200ms instead of sleeping until the next actual
-  deadline.
-- Single process only. Optimistic appends stop two processes from corrupting a history,
-  but there's no leasing or task queue, so if you ran two of them they'd both just do the
-  same work twice.
+- **Replay cost grows with workflow length.** A workflow with N steps runs N+1 times, and
+  each run reads the full history. Fine for this rule, not for workflows with hundreds of
+  steps. Temporal avoids this by keeping the workflow paused in memory instead of
+  replaying each time. This would be the first thing to improve.
+- **Activities are at-least-once.** The side effect runs before its result is recorded, so
+  a crash in between makes it run again (there's a test for this). Recording first would
+  risk losing the activity completely, which seemed worse. A proper fix would be an
+  idempotency key checked by the downstream service.
+- **No retries.** A failed activity throws straight into the workflow.
+- **No per-type signal buffer.** Handlers see each payload as the log replays, so "was the
+  last delivery update DELIVERED" works, but "did any event have amount > 500" has to be
+  tracked by the workflow itself.
+- **Simple payload format.** Two strings split on the first newline, to avoid adding
+  Jackson. Good enough here, not for production.
+- **Polling timers.** Due timers are checked every 200 ms instead of sleeping until the
+  next deadline.
+- **Single process.** There's no leasing or task queue. Two engines on the same database
+  won't corrupt anything, but they will both do the same work.
 
-## What this is (and isn't)
+Out of scope on purpose: distributed workers, sharding, workflow versioning and a UI.
+This project only covers the replay mechanism those features are built on.
 
-Just the core replay mechanism, nothing more, on purpose. No distributed execution, no
-worker fleet, no sharding, no workflow versioning, no UI. Temporal is basically all of
-those things built on top of this same replay idea. This project is just the idea, by
-itself.
+## Running
 
-## Running it
+Requires Java 21+ and Maven. Dependencies are just `sqlite-jdbc` and JUnit 5. The demo
+uses the `sqlite3` CLI to print the raw log, if it's installed.
 
 ```sh
 mvn test     # 41 tests
-./demo.sh    # all three scenarios above
+./demo.sh    # all three scenarios
 ```
-
-Java 21. Only real dependencies are sqlite-jdbc and JUnit 5.
